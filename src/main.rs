@@ -1,5 +1,7 @@
-use axelwas_chess::{Color as ChessColor, EndStates, PieceTypes, Place, Position};
+use axelwas_chess::{Color as ChessColor, EndStates, PieceTypes, Place};
 use crate::wrapper::{Game, PROMOTIONS_CHOICESAA};
+use crate::network::Connection;
+mod network;
 mod wrapper;
 
 use std::collections::HashMap;
@@ -37,11 +39,16 @@ pub struct ChessGui {
     selected_piece: Option<Place>,
     legalmoves: Vec<Place>,
     pending: Option<(Place, Place)>,
-    text: Option<Text>
+    text: Option<Text>,
+
+    netty: Connection,
+    my_color: ChessColor,
+    waiting: Option<(Place, Place, Option<PieceTypes>)>,
+    game_over: bool,
 }
 
 impl ChessGui {
-    pub fn new(ctx: &mut Context) -> GameResult<ChessGui> {
+    pub fn new(ctx: &mut Context, netty: Connection, my_color: ChessColor) -> GameResult<ChessGui> {
         let mut sprites = HashMap::new();
         sprites.insert('P', graphics::Image::from_path(ctx, "/wp.png")?);
         sprites.insert('R', graphics::Image::from_path(ctx, "/wr.png")?);
@@ -65,7 +72,12 @@ impl ChessGui {
             selected_piece: None,
             legalmoves: Vec::new(),
             pending: None,
-            text: None
+            text: None,
+
+            netty,
+            my_color,
+            waiting: None,
+            game_over: false,
         })
     }
 
@@ -102,11 +114,128 @@ impl ChessGui {
 
         return;
     }
-    
+
+    // helper
+    fn show_text(&mut self, msg: &str) {
+        // https://github.com/ggez/ggez/blob/9c865474504084b60204874bc028ba91c5f013b9/examples/text.rs#L45
+        let text = Text::new(TextFragment {
+            text: msg.to_string(),
+            color: Some(Color::new(0.0, 0.0, 1.0, 1.0)),
+            font: Some("LiberationMono-Regular".into()),
+            scale: Some(PxScale::from(50.0)),
+            ..Default::default()
+        });
+        self.text = Some(text);
+    }
+
+    fn send_move(&mut self, from: Place, to: Place, promote_to: Option<PieceTypes>) {
+        self.pending = None;
+        self.selected_piece = None;
+        self.legalmoves.clear();
+
+        if self.game.board_previewing(from, to, promote_to).is_none() {
+            return;
+        }
+
+        let board = self.game.board_previewing(from, to, promote_to).unwrap();
+        let a = network::move_into_protocol(from, to, promote_to, &board);
+        self.netty.send(&a);
+        self.waiting = Some((from, to, promote_to));
+    }
+
+    fn check_end(&mut self) {
+        let status = self.game.status();
+        if status == EndStates::Checkmate {
+            if self.game.turn() == ChessColor::White {
+                println!("Checkmate! Black won");
+                self.show_text("Checkmate! Black Won");
+            } else {
+                println!("Checkmate! White won");
+                self.show_text("Checkmate! White Won");
+            }
+            self.game_over = true;
+        } else if status == EndStates::Stalemate {
+            println!("Stalemate");
+            self.show_text("Stalemate");
+            self.game_over = true;
+        }
+    }
+
+    fn checkopponent(&mut self, line: &str) {
+        let movee = network::decoder3000(line);
+
+        if movee.is_none() {
+            println!("REJECTED: {:?}", line);
+            self.netty.send("REJECT\n");
+            return;
+        }
+
+        let (from, to, promo, their_board) = movee.unwrap();
+
+        let board = self.game.board_previewing(from, to, promo);
+        let board_ok;
+        if board.is_some() {
+            board_ok = network::check_same_board(&board.unwrap(), &their_board);
+        } else {
+            board_ok = false;
+        }
+
+        if self.game_over || self.game.turn() == self.my_color {
+            self.netty.send("REJECT\n");
+            return;
+        }
+
+        if !board_ok {
+            self.netty.send("REJECT\n");
+            return;
+        }
+
+        if !self.game.play(from, to, promo) {
+            self.netty.send("REJECT\n");
+            return;
+        }
+
+        self.selected_piece = None;
+        self.legalmoves.clear();
+
+        let status = self.game.status();
+        if status == EndStates::Checkmate {
+            self.netty.send("CHECKMATE\n");
+        } else if status == EndStates::Stalemate {
+            self.netty.send("STALEMATE\n");
+        } else {
+            self.netty.send("OK\n");
+        }
+
+        self.check_end();
+
+    }
 }
 
 impl event::EventHandler<Context, GameError> for ChessGui {
     fn update(&mut self, _ctx: &mut Context) -> GameResult {
+        while let Some(line) = self.netty.polla() {
+            if line == "DISCONNECTED" {
+                println!("opponent left");
+
+                if !(self.game_over) {
+                    self.show_text("opponent left");
+                    self.game_over = true;
+                }
+            } else if line == "OK" || line == "CHECKMATE" || line == "STALEMATE" {
+                let waiting = self.waiting.take();
+                let (from, to, promo) = waiting.unwrap();
+                self.actuallyplay(from, to, promo);
+                self.check_end();
+            } else if line == "REJECT" {
+                if self.waiting.take().is_some() {
+                    println!("REJECTED FUUUU");
+                }
+            } else {
+                self.checkopponent(&line);
+            }
+        }
+
         Ok(())
     }
 
@@ -218,6 +347,10 @@ impl event::EventHandler<Context, GameError> for ChessGui {
             return Ok(()); // compilor arg aja baja
         }
 
+        if !(!self.game_over && self.waiting.is_none() && self.game.turn() == self.my_color) {
+            return Ok(());
+        }
+
         // om ett move är pending i.e promotion så visa meny
         if self.pending.is_some() {
             let pending = self.pending.unwrap();
@@ -230,7 +363,7 @@ impl event::EventHandler<Context, GameError> for ChessGui {
             if x >= x0 && x < x0 + menu && y >= y0 && y < y0 + SQUARE_SIZE {
                 let i = ((x - x0) / SQUARE_SIZE) as usize;
 
-                self.actuallyplay(from, to, Some(PROMOTIONS_CHOICESAA[i]));
+                self.send_move(from, to, Some(PROMOTIONS_CHOICESAA[i]));
             }
 
             return Ok(());
@@ -239,51 +372,13 @@ impl event::EventHandler<Context, GameError> for ChessGui {
         let clicked = self.place(x, y).unwrap();
         if self.selected_piece.is_some() {
             let from = self.selected_piece.unwrap();
-
             if self.legalmoves.contains(&clicked) {
                 if self.game.is_promotion(from, clicked) {
                     self.pending = Some((from, clicked));
-                    return Ok(());
                 } else {
-                    self.actuallyplay(from, clicked, None);
+                    self.send_move(from, clicked, None);
+                    return Ok(());
                 }
-
-
-
-                
-
-                let aa = self.game.status();
-                if aa == EndStates::Checkmate {
-                    if Position::in_check(&self.game.position, ChessColor::Black) {
-                        println!("Checkmate! White Won"); // impl gui
-
-                        // https://github.com/ggez/ggez/blob/9c865474504084b60204874bc028ba91c5f013b9/examples/text.rs#L45
-                        let text = Text::new(TextFragment {
-                            text: "Checkmate! White Won".to_string(),
-                            color: Some(Color::new(0.0, 0.0, 1.0, 1.0)),
-                            font: Some("LiberationMono-Regular".into()),
-                            scale: Some(PxScale::from(50.0)),
-                            ..Default::default()
-                        });
-                        self.text = Some(text);
-
-                    } else if Position::in_check(&self.game.position, ChessColor::White) {
-                        println!("Checkmate! Black won"); // impl gui
-
-                        let text = Text::new(TextFragment {
-                            text: "Checkmate! Black Won".to_string(),
-                            color: Some(Color::new(0.0, 0.0, 1.0, 1.0)),
-                            font: Some("LiberationMono-Regular".into()),
-                            scale: Some(PxScale::from(50.0)),
-                            ..Default::default()
-                        });
-                        self.text = Some(text);
-                    }
-                } else if aa == EndStates::Stalemate {
-                    println!("Stalemate");
-                } 
-
-                return Ok(());
             }
         }
 
@@ -294,12 +389,38 @@ impl event::EventHandler<Context, GameError> for ChessGui {
     
 
 fn main() -> GameResult {
+    let args: Vec<String> = std::env::args().collect();
+    println!("{:?}", args);
+
+    let mode = args.get(1).map(String::as_str);
+    let result;
+
+    if mode == Some("host") {
+        result = Connection::host();
+    } else if mode == Some("join") {
+        let addr;
+        if args.len() > 2 {
+            addr = args[2].as_str();
+        } else {
+            addr = "127.0.0.1";
+        };
+
+        result = Connection::join(addr);
+
+    } else {
+        println!("wrong usage idiot");
+        panic!();
+    };
+
+    let result = result.map_err(|e| {GameError::CustomError(e.to_string())});
+    let (netty, my_color) = result?;
+    
     let (mut ctx, event_loop) = ggez::ContextBuilder::new("skibidi chess", "alanoo")
         .add_resource_path("./assets")
         .window_setup(ggez::conf::WindowSetup::default().title("Skibidi Chess"))
         .window_mode(ggez::conf::WindowMode::default().dimensions(BOARD, BOARD))
         .build()?;
 
-    let game = ChessGui::new(&mut ctx)?;
+    let game = ChessGui::new(&mut ctx, netty, my_color)?;
     event::run(ctx, event_loop, game)
 }

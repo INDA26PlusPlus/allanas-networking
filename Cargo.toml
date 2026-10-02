@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axelwas-chess = { path = "axelwas-chess" }
+axelwas-chess = {git = "https://github.com/INDA26PlusPlus/axelwas-chess"}
 ggez = "0.10.0"

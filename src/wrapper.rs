@@ -62,17 +62,46 @@ impl Game {
         return targets
     }
 
-    pub fn play(&mut self, from: Place, to: Place, promote_to: Option<PieceTypes>) -> bool {
+    fn build_move(&self, from: Place, to: Place, promote_to: Option<PieceTypes>) -> Option<Move> {
         let wanttoplay = if self.is_promotion(from, to) {
             from.goto(&to).into_promotion(Some(promote_to.unwrap_or(PieceTypes::Queen)))
         } else {
             from.goto(&to)
         };
-        if !self.legal.contains(&wanttoplay) { 
-            return false; 
+        if !self.legal.contains(&wanttoplay) {
+            return None;
+        }
+        return Some(wanttoplay)
+    }
+
+    pub fn board_previewing(&self, from: Place, to: Place, promote_to: Option<PieceTypes>) -> Option<String> {
+        let mut board = String::with_capacity(64);
+        let mv = self.build_move(from, to, promote_to)?;
+        let next = self.position.clone().execute_move(mv).ok()?;
+
+        for row in 0..8 {
+            for file in 0..8 {
+                let piece = next.piece_on(Place{row, file});
+
+                if piece.is_some() {
+                    board.push(piece.unwrap().into_ascii());
+                    println!("{:?}", piece.unwrap().into_ascii());
+                } else {
+                    board.push('\x20');
+                }
+            }
         }
 
-        let next = match 
+        return Some(board)
+    }
+
+    pub fn play(&mut self, from: Place, to: Place, promote_to: Option<PieceTypes>) -> bool {
+        let wanttoplay = match self.build_move(from, to, promote_to) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let next = match
             self.position.clone().execute_move(wanttoplay) {
             Ok(position) => position,
             Err(_) => return false,
